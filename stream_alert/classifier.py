@@ -39,8 +39,6 @@ logger = logging.getLogger('StreamAlert')
 class InvalidSchemaError(Exception):
     pass
 
-# class StreamClassifier(object):
-#
 
 class StreamPayload(object):
     """Classify and parse a raw record into its declared type.
@@ -62,13 +60,8 @@ class StreamPayload(object):
 
         record: A typed record.
 
-        s3_file: A full path to a downloaded file from S3.
-
     Public Methods:
-        classify_record
-        parse_json
-        parse_csv
-        parse_syslog
+        refresh_record
     """
 
     def __init__(self, **kwargs):
@@ -80,21 +73,28 @@ class StreamPayload(object):
             config (dict): Loaded JSON configuration files.  Contains two keys:
                 logs, and sources
         """
-        self.valid = False
+        self.raw_record = kwargs['raw_record']
         self.service = None
         self.entity = None
         self.type = None
         self.log_source = None
         self.record = None
-        self.raw_record = kwargs.get('raw_record')
-
-        self.log_metadata = kwargs.get('log_metadata', None)
-        self.env = kwargs.get('env')
-        self.config = kwargs.get('config')
+        self.valid = False
+        self.valid_source = None
 
     def __repr__(self):
-        return '<StreamPayload valid:{} log_source:{} entity:{} type:{} record:{} >'.format(
-            self.valid, self.log_source, self.entity, self.type, self.record)
+        repr_str = ('<StreamPayload valid:{} '
+                    'log_source:{} '
+                    'entity:{} '
+                    'type:{} '
+                    'record:{} >'
+        ).format(self.valid,
+                 self.log_source,
+                 self.entity,
+                 self.type,
+                 self.record)
+
+        return repr_str
 
     def refresh_record(self, new_record):
         """Replace the currently loaded record with a new one.
@@ -112,7 +112,12 @@ class StreamPayload(object):
         self.type = None
         self.raw_record = new_record
 
-    def map_source(self):
+
+class StreamClassifier(object):
+    def __init__(self, **kwargs):
+        self.config = kwargs['config']
+
+    def map_source(self, payload):
         """Map a record to its originating AWS service and entity.
 
         Each raw record contains a set of keys to represent its source.
@@ -125,10 +130,10 @@ class StreamPayload(object):
             self.log_metadata: All logs for a declared entity, with their attrs.
         """
         # check raw record for either kinesis or s3 keys
-        if 'kinesis' in self.raw_record:
-            self.service = 'kinesis'
-        elif 's3' in self.raw_record:
-            self.service = 's3'
+        if 'kinesis' in payload.raw_record:
+            payload.service = 'kinesis'
+        elif 's3' in payload.raw_record:
+            payload.service = 's3'
 
         # map the entity name from a record
         entity_mapper = {
@@ -136,18 +141,22 @@ class StreamPayload(object):
             's3': lambda r: r['s3']['bucket']['name']
         }
         # get the entity name
-        self.entity = entity_mapper[self.service](self.raw_record)
+        payload.entity = entity_mapper[payload.service](payload.raw_record)
 
-        # get all entities for the configured service (s3 or kinesis)
-        all_service_entities = self.config['sources'][self.service]
-        config_entity = all_service_entities.get(self.entity)
+        # if the payload's entity is found in the config and contains logs
+        if self._payload_logs(payload):
+            payload.valid_source = True
 
+    def _payload_logs(self, payload):
+        # get all logs for the configured service/enetity (s3 or kinesis)
+        all_service_entities = self.config['sources'][payload.service]
+        config_entity = all_service_entities.get(payload.entity)
         if config_entity:
-            entity_log_sources = config_entity['logs']
-            self.log_metadata = self._log_metadata(entity_log_sources, self.config.get('logs'))
+            return config_entity['logs']
+        else:
+            return False
 
-    @staticmethod
-    def _log_metadata(entity_log_sources, all_config_logs):
+    def log_metadata(self, payload):
         """Return a mapping of all log sources to a given entity with attributes.
 
         Args:
@@ -169,14 +178,18 @@ class StreamPayload(object):
             }
         """
         metadata = {}
+
+        all_config_logs = self.config['logs']
+        entity_log_sources = self._payload_logs(payload)
         for log_source, log_source_attributes in all_config_logs.iteritems():
             source_pieces = log_source.split(':')
             category = source_pieces[0]
             if category in entity_log_sources:
                 metadata[log_source] = log_source_attributes
+
         return metadata
 
-    def classify_record(self, data):
+    def classify_record(self, payload, data):
         """Classify and type raw record passed into StreamAlert.
 
         Before we apply our rules to a record passed to the lambda function,
@@ -187,19 +200,16 @@ class StreamPayload(object):
         Args:
             data (str): a raw record to classify
         """
-        if self.log_metadata:
-            parse_result = self._parse(data)
-            if all([
-                    parse_result,
-                    self.service,
-                    self.entity,
-                    self.type,
-                    self.log_source,
-                    self.record
-            ]):
-                self.valid = True
+        parse_result = self._parse(payload, data)
+        if all([parse_result,
+                payload.service,
+                payload.entity,
+                payload.type,
+                payload.log_source,
+                payload.record]):
+            payload.valid = True
 
-    def _parse(self, data):
+    def _parse(self, payload, data):
         """Parse a record into a declared type.
 
         Args:
@@ -213,23 +223,27 @@ class StreamPayload(object):
         Returns:
             A boolean representing the success of the parse.
         """
-        for log_name, attributes in self.log_metadata.iteritems():
-            if not self.type:
+        for log_name, attributes in self.log_metadata(payload).iteritems():
+            if not payload.type:
                 parser_name = attributes['parser']
             else:
-                parser_name = self.type
+                parser_name = payload.type
 
             options = {}
             options['hints'] = attributes.get('hints')
             options['delimiter'] = attributes.get('delimiter')
             options['separator'] = attributes.get('separator')
             options['parser'] = parser_name
-            options['service'] = self.service
+            options['service'] = payload.service
             schema = attributes['schema']
 
             parser_class = get_parser(parser_name)
             parser = parser_class(data, schema, options)
             parsed_data = parser.parse()
+
+            # Used for short circuiting parser determination
+            if parser.payload_type:
+                payload.type = parser.payload_type
 
             logger.debug('log_name: %s', log_name)
             logger.debug('parsed_data: %s', parsed_data)
@@ -237,9 +251,9 @@ class StreamPayload(object):
             if parsed_data:
                 parsed_and_typed_data = self._convert_type(parsed_data, schema, options)
                 if parsed_and_typed_data:
-                    self.log_source = log_name
-                    self.type = parser_name
-                    self.record = parsed_and_typed_data
+                    payload.log_source = log_name
+                    payload.type = parser_name
+                    payload.record = parsed_and_typed_data
                     return True
         return False
 
